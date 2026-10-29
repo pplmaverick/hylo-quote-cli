@@ -1,0 +1,15 @@
+[package]
+name = "hylo-quote-cli"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only CLI for hyUSD quotes on Solana mainnet, built on the Hylo SDK."
+license = "MIT"
+publish = false
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+hylo-quotes = "=2.7.3"
+serde_json = "1"
+solana-rpc-client = "=2.3.13"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
