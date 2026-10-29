@@ -29,7 +29,7 @@ cargo build --release --locked
 ## Usage
 
 ```sh
-hylo-quote-cli quote --from <JitoSOL|USDC|hyUSD> --to <JitoSOL|USDC|hyUSD> --amount <number> [--json]
+hylo-quote-cli quote --from <JitoSOL|USDC|hyUSD> --to <JitoSOL|USDC|hyUSD> --amount <number> [--json] [--retries N]
 ```
 
 `--amount` is a decimal amount of the input token (for example `1.5`).
@@ -50,6 +50,11 @@ Compute      100000
 token's own units, not base units. `compute_units` is the figure `hylo-quotes`
 reports for the instructions it builds; those instructions are discarded.
 
+`--retries N` (default 3, `0` disables) retries when the price oracle was
+stale (exit code 3), waiting 1s, 2s, 4s, ... between attempts. Each retry
+re-reads the on-chain state, and a notice is printed to stderr, so stdout (and
+`--json` output) stays clean. Other errors are never retried.
+
 ### Exit codes
 
 | Code | Meaning |
@@ -57,7 +62,7 @@ reports for the instructions it builds; those instructions are discarded.
 | 0 | Quote printed |
 | 1 | Other error (bad input, RPC failure, error returned by `hylo-quotes`) |
 | 2 | hyUSD redemption not quoted because of the redeem fee curve (see below) |
-| 3 | Price oracle account was stale when read; retry |
+| 3 | Price oracle account was still stale after all retries (`--retries 0` returns this on the first failure) |
 
 ## RPC endpoint
 
@@ -91,8 +96,9 @@ RPC_URL="https://your-rpc.example" hylo-quote-cli quote --from JitoSOL --to hyUS
 - **Quotes move with the oracle price.** Repeated runs differ slightly.
 - **Stale oracle.** Quotes that depend on the SOL/USD price can fail with
   `Oracle did not yield a price within the configured age window.` This
-  occurred intermittently during testing and cleared on retry. The tool does not
-  retry by itself.
+  occurred intermittently during testing and cleared on retry. The tool retries
+  automatically (see `--retries`); if the oracle stays stale through every
+  attempt it exits with code 3.
 - Redeem-curve and oracle errors are recognised by matching the error text from
   `hylo-quotes`, so a wording change in a future SDK version may turn them into
   generic errors (exit code 1).

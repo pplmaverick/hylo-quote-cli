@@ -1,8 +1,10 @@
 //! Read-only hyUSD quote CLI. Uses no keypair: it never signs or sends a
 //! transaction. The quote's `user` is a throwaway pubkey that only shows up
 //! in the (discarded) instructions.
+use std::future::Future;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use hylo_quotes::prelude::*;
@@ -11,6 +13,7 @@ use solana_rpc_client::nonblocking::rpc_client::RpcClient;
 
 const DEFAULT_RPC: &str = "https://api.mainnet-beta.solana.com";
 /// Slippage only affects the (discarded) instructions, not the quoted amounts.
+const DEFAULT_RETRIES: u32 = 3;
 const SLIPPAGE_BPS: u64 = 50;
 
 #[derive(Parser)]
@@ -35,6 +38,10 @@ enum Command {
         /// Print machine-readable JSON instead of a table
         #[arg(long)]
         json: bool,
+        /// Retries when the price oracle was stale (exit code 3), waiting
+        /// 1s, 2s, 4s, ... between attempts. 0 disables retrying.
+        #[arg(long, default_value_t = DEFAULT_RETRIES)]
+        retries: u32,
     },
 }
 
@@ -104,6 +111,40 @@ fn fmt_fixed(bits: u64, exp: i8) -> String {
     )
 }
 
+/// Exit code for a stale price oracle; the only error worth retrying.
+const EXIT_STALE_ORACLE: u8 = 3;
+
+/// Wait before retry number `attempt` (0-based): `base` * 2^attempt.
+fn backoff(base: Duration, attempt: u32) -> Duration {
+    base.saturating_mul(2u32.saturating_pow(attempt))
+}
+
+/// Runs `op`, retrying up to `retries` times while it fails with the stale
+/// oracle code. The wait doubles each time: `base`, 2*`base`, 4*`base`, ...
+async fn with_retries<T, F, Fut>(retries: u32, base: Duration, mut op: F) -> Result<T, (u8, String)>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, (u8, String)>>,
+{
+    let mut attempt = 0;
+    loop {
+        match op().await {
+            Err((EXIT_STALE_ORACLE, msg)) if attempt < retries => {
+                let wait = backoff(base, attempt);
+                eprintln!(
+                    "oracle stale ({}), retrying in {:?} ({}/{retries})",
+                    msg.lines().next().unwrap_or_default(),
+                    wait,
+                    attempt + 1
+                );
+                tokio::time::sleep(wait).await;
+                attempt += 1;
+            }
+            other => return other,
+        }
+    }
+}
+
 fn is_redeem_curve_error(msg: &str) -> bool {
     msg.contains("redeem fee") && msg.contains("curve domain")
 }
@@ -125,6 +166,7 @@ async fn run(cli: Cli) -> Result<(), (u8, String)> {
         to,
         amount,
         json,
+        retries,
     } = cli.command;
     if from == to {
         return Err((1, "error: --from and --to must differ".into()));
@@ -139,35 +181,38 @@ async fn run(cli: Cli) -> Result<(), (u8, String)> {
     let strategy = ProtocolStateStrategy::new(Arc::new(RpcStateProvider::new(rpc)));
     let user = Pubkey::new_unique();
 
-    let (q, meta) = strategy
-        .runtime_quote_with_metadata(from.mint(), to.mint(), amount_in, user, SLIPPAGE_BPS)
-        .await
-        .map_err(|e| {
-            let msg = format!("{e:#}");
-            if from == Symbol::HyUsd && is_redeem_curve_error(&msg) {
-                (
-                    2,
-                    format!(
-                        "redeem not quoted: {msg}\n\
+    let (q, meta) = with_retries(retries, Duration::from_secs(1), || async {
+        strategy
+            .runtime_quote_with_metadata(from.mint(), to.mint(), amount_in, user, SLIPPAGE_BPS)
+            .await
+            .map_err(|e| {
+                let msg = format!("{e:#}");
+                if from == Symbol::HyUsd && is_redeem_curve_error(&msg) {
+                    (
+                        2,
+                        format!(
+                            "redeem not quoted: {msg}\n\
              By design (docs.hylo.so, Hylo Equations): a volatile pool does not quote a \
              redemption that would leave its collateral ratio above the redeem fee curve \
              (150%). Redemptions stay available through pools below target and through the \
              USDC pool; try `--to USDC`."
-                    ),
-                )
-            } else if msg.contains("Oracle did not yield a price") {
-                (
-                    3,
-                    format!(
-                        "error: {msg}\n\
+                        ),
+                    )
+                } else if msg.contains("Oracle did not yield a price") {
+                    (
+                        EXIT_STALE_ORACLE,
+                        format!(
+                            "error: {msg}\n\
              The on-chain price oracle account was stale when read. This is usually \
              transient; retry in a few seconds."
-                    ),
-                )
-            } else {
-                (1, format!("error: {msg}"))
-            }
-        })?;
+                        ),
+                    )
+                } else {
+                    (1, format!("error: {msg}"))
+                }
+            })
+    })
+    .await?;
 
     let out = fmt_fixed(q.amount_out.bits, q.amount_out.exp);
     let inp = fmt_fixed(q.amount_in.bits, q.amount_in.exp);
@@ -216,6 +261,71 @@ mod tests {
         assert_eq!(fmt_fixed(129_813_136, -6), "129.813136");
         assert_eq!(fmt_fixed(7_370_000, -9), "0.007370000");
         assert_eq!(fmt_fixed(5, 0), "5");
+    }
+
+    use std::cell::Cell;
+
+    fn stale() -> (u8, String) {
+        (EXIT_STALE_ORACLE, "error: stale".into())
+    }
+
+    #[tokio::test]
+    async fn retries_stale_oracle_then_succeeds() {
+        let calls = Cell::new(0);
+        let r = with_retries(3, Duration::ZERO, || async {
+            calls.set(calls.get() + 1);
+            if calls.get() < 3 {
+                Err(stale())
+            } else {
+                Ok(7)
+            }
+        })
+        .await;
+        assert_eq!(r, Ok(7));
+        assert_eq!(calls.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn gives_up_after_retries_exhausted() {
+        let calls = Cell::new(0);
+        let r: Result<(), _> = with_retries(3, Duration::ZERO, || async {
+            calls.set(calls.get() + 1);
+            Err(stale())
+        })
+        .await;
+        assert_eq!(r.unwrap_err().0, EXIT_STALE_ORACLE);
+        assert_eq!(calls.get(), 4); // 1 attempt + 3 retries
+    }
+
+    #[tokio::test]
+    async fn zero_retries_disables_retrying() {
+        let calls = Cell::new(0);
+        let _: Result<(), _> = with_retries(0, Duration::ZERO, || async {
+            calls.set(calls.get() + 1);
+            Err(stale())
+        })
+        .await;
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_other_errors() {
+        let calls = Cell::new(0);
+        let r: Result<(), _> = with_retries(3, Duration::ZERO, || async {
+            calls.set(calls.get() + 1);
+            Err((2, "redeem".to_string()))
+        })
+        .await;
+        assert_eq!(r.unwrap_err().0, 2);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn backoff_doubles_from_one_second() {
+        let secs: Vec<u64> = (0..3)
+            .map(|a| backoff(Duration::from_secs(1), a).as_secs())
+            .collect();
+        assert_eq!(secs, [1, 2, 4]);
     }
 
     #[test]
