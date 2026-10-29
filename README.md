@@ -63,6 +63,7 @@ re-reads the on-chain state, and a notice is printed to stderr, so stdout (and
 | 1 | Other error (bad input, RPC failure, error returned by `hylo-quotes`) |
 | 2 | hyUSD redemption not quoted because of the redeem fee curve (see below) |
 | 3 | Price oracle account was still stale after all retries (`--retries 0` returns this on the first failure) |
+| 4 | hyUSD → USDC amount exceeds what the USDC pool can cover (not retried) |
 
 ## RPC endpoint
 
@@ -86,10 +87,19 @@ RPC_URL="https://your-rpc.example" hylo-quote-cli quote --from JitoSOL --to hyUS
   When this happens the tool prints an explanation and exits with code 2. The
   docs say redemptions stay available through pools below target and through the
   USDC pool, so `--to USDC` may work.
-- **hyUSD → USDC can fail for larger amounts.** In testing on 2026-10-29,
-  10 hyUSD → USDC was quoted and 20, 50, 75 and 100 hyUSD returned
-  `Overflow while burning virtual stablecoin.` The cause was not investigated
-  and is not covered in the Hylo docs I read; the error is shown as returned.
+- **hyUSD → USDC is capped by the USDC pool.** The SDK refuses a hyUSD → USDC
+  quote when the amount after the 0.2% redeem fee exceeds the USDC pair's
+  virtual stablecoin supply (`hylo-quotes`,
+  `src/token_operation/exchange.rs`, `TokenOperation<HYUSD, USDC>`), and it
+  reports this as `Overflow while burning virtual stablecoin.` Despite the
+  wording, it is a capacity check, not an arithmetic overflow. The tool prints
+  `USDC pool cannot cover this redemption; try a smaller amount` and exits with
+  code 4 without retrying. Observed on 2026-10-29: the USDC pair's virtual
+  stablecoin supply was 16.590972 (equal to its vault balance), so 16.624 hyUSD
+  was quoted and 16.625 hyUSD was refused. That figure is a snapshot and changes
+  with the pool's state, so the cutoff will move. Hylo's docs say redemptions
+  stay available through the USDC pool "while it holds enough USDC"; see
+  [Dynamic Collateral Routing](https://docs.hylo.so/protocol-overview/dynamic-collateral-routing.md).
 - **Quotes are computed from protocol state and are not simulated.** As the
   `hylo-quotes` documentation says, `ProtocolStateStrategy` does not check
   wallet balances.
@@ -99,7 +109,7 @@ RPC_URL="https://your-rpc.example" hylo-quote-cli quote --from JitoSOL --to hyUS
   occurred intermittently during testing and cleared on retry. The tool retries
   automatically (see `--retries`); if the oracle stays stale through every
   attempt it exits with code 3.
-- Redeem-curve and oracle errors are recognised by matching the error text from
+- Redeem-curve, USDC-capacity and oracle errors are recognised by matching the error text from
   `hylo-quotes`, so a wording change in a future SDK version may turn them into
   generic errors (exit code 1).
 - Only JitoSOL, USDC and hyUSD are exposed. Other Hylo assets are not.

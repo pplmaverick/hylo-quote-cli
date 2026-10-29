@@ -145,6 +145,48 @@ where
     }
 }
 
+/// Exit code when the USDC pool cannot cover a hyUSD -> USDC redemption.
+const EXIT_USDC_CAPACITY: u8 = 4;
+
+fn is_burn_underflow_error(msg: &str) -> bool {
+    msg.contains("Overflow while burning virtual stablecoin")
+}
+
+/// Maps an error message from `hylo-quotes` to an exit code and the text to
+/// print. Matching is on the message text, see README "Known limitations".
+fn classify_error(from: Symbol, to: Symbol, msg: &str) -> (u8, String) {
+    if from == Symbol::HyUsd && is_redeem_curve_error(msg) {
+        (
+            2,
+            format!(
+                "redeem not quoted: {msg}\n\
+                 By design (docs.hylo.so, Hylo Equations): a volatile pool does not quote a \
+                 redemption that would leave its collateral ratio above the redeem fee curve \
+                 (150%). Redemptions stay available through pools below target and through the \
+                 USDC pool; try `--to USDC`."
+            ),
+        )
+    } else if from == Symbol::HyUsd && to == Symbol::Usdc && is_burn_underflow_error(msg) {
+        (
+            EXIT_USDC_CAPACITY,
+            format!(
+                "USDC pool cannot cover this redemption; try a smaller amount\n(SDK error: {msg})"
+            ),
+        )
+    } else if msg.contains("Oracle did not yield a price") {
+        (
+            EXIT_STALE_ORACLE,
+            format!(
+                "error: {msg}\n\
+                 The on-chain price oracle account was stale when read. This is usually \
+                 transient; retry in a few seconds."
+            ),
+        )
+    } else {
+        (1, format!("error: {msg}"))
+    }
+}
+
 fn is_redeem_curve_error(msg: &str) -> bool {
     msg.contains("redeem fee") && msg.contains("curve domain")
 }
@@ -185,32 +227,7 @@ async fn run(cli: Cli) -> Result<(), (u8, String)> {
         strategy
             .runtime_quote_with_metadata(from.mint(), to.mint(), amount_in, user, SLIPPAGE_BPS)
             .await
-            .map_err(|e| {
-                let msg = format!("{e:#}");
-                if from == Symbol::HyUsd && is_redeem_curve_error(&msg) {
-                    (
-                        2,
-                        format!(
-                            "redeem not quoted: {msg}\n\
-             By design (docs.hylo.so, Hylo Equations): a volatile pool does not quote a \
-             redemption that would leave its collateral ratio above the redeem fee curve \
-             (150%). Redemptions stay available through pools below target and through the \
-             USDC pool; try `--to USDC`."
-                        ),
-                    )
-                } else if msg.contains("Oracle did not yield a price") {
-                    (
-                        EXIT_STALE_ORACLE,
-                        format!(
-                            "error: {msg}\n\
-             The on-chain price oracle account was stale when read. This is usually \
-             transient; retry in a few seconds."
-                        ),
-                    )
-                } else {
-                    (1, format!("error: {msg}"))
-                }
-            })
+            .map_err(|e| classify_error(from, to, &format!("{e:#}")))
     })
     .await?;
 
@@ -326,6 +343,36 @@ mod tests {
             .map(|a| backoff(Duration::from_secs(1), a).as_secs())
             .collect();
         assert_eq!(secs, [1, 2, 4]);
+    }
+
+    const BURN_MSG: &str = "Overflow while burning virtual stablecoin.";
+
+    #[test]
+    fn recognises_burn_underflow_for_hyusd_to_usdc() {
+        assert!(is_burn_underflow_error(BURN_MSG));
+        let (code, text) = classify_error(Symbol::HyUsd, Symbol::Usdc, BURN_MSG);
+        assert_eq!(code, EXIT_USDC_CAPACITY);
+        assert_eq!(code, 4);
+        assert!(text.starts_with("USDC pool cannot cover this redemption; try a smaller amount"));
+    }
+
+    #[test]
+    fn burn_underflow_on_other_routes_stays_generic() {
+        let (code, text) = classify_error(Symbol::HyUsd, Symbol::JitoSol, BURN_MSG);
+        assert_eq!(code, 1);
+        assert!(text.starts_with("error:"));
+    }
+
+    #[tokio::test]
+    async fn capacity_error_is_not_retried() {
+        let calls = Cell::new(0);
+        let r: Result<(), _> = with_retries(3, Duration::ZERO, || async {
+            calls.set(calls.get() + 1);
+            Err(classify_error(Symbol::HyUsd, Symbol::Usdc, BURN_MSG))
+        })
+        .await;
+        assert_eq!(r.unwrap_err().0, EXIT_USDC_CAPACITY);
+        assert_eq!(calls.get(), 1);
     }
 
     #[test]
